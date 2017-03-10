@@ -11,6 +11,5 @@ all: coronet_examples
 
 coronet_examples: $(patsubst %,build/%,${CORONET_EXAMPLES})
 
-
-build/%: examples/%.cpp
+build/%: examples/%.cpp ${CORONET}
 	${CXX} ${CFLAGS} -I${CORONET_DIR} ${LIBS} $< -o $@
