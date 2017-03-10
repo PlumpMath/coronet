@@ -1,3 +1,5 @@
+#ifndef _CORONET_HPP
+#define _CORONET_HPP
 #include <boost/context/all.hpp>
 #include <vector>
 #include <functional>
@@ -224,3 +226,4 @@ public:
         }
     }
 };
+#endif
