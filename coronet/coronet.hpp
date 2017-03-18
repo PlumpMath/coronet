@@ -89,7 +89,7 @@ class coronet {
 
     void add_watched_socket(int fd) {
         struct epoll_event watched;
-        watched.events = (EPOLLIN | EPOLLRDHUP | EPOLLET);
+        watched.events = (EPOLLIN | EPOLLRDHUP);
         watched.data.fd = fd;
         if (epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &watched) == -1) {
             throw std::system_error(errno, std::generic_category(), "epoll_ctl");
@@ -98,7 +98,7 @@ class coronet {
 
     void edit_watched_socket(int fd, bool write = false) {
         struct epoll_event watched;
-        watched.events = EPOLLET | EPOLLRDHUP | (write ? EPOLLOUT : EPOLLIN);
+        watched.events = EPOLLRDHUP | (write ? EPOLLOUT : EPOLLIN);
         watched.data.fd = fd;
         if (epoll_ctl(epoll, EPOLL_CTL_MOD, fd, &watched) == -1) {
             throw std::system_error(errno, std::generic_category(), "epoll_ctl");
@@ -236,8 +236,8 @@ public:
     }
 
     void run() {
+        std::vector<struct epoll_event> events(max_events);
         while (true) {
-            std::vector<struct epoll_event> events(max_events);
             int num_fd = epoll_wait(epoll, events.data(), max_events, -1);
             if (num_fd == -1 && errno == EINTR) continue;
             if (num_fd == -1) {
