@@ -3,19 +3,68 @@
 #include <boost/context/all.hpp>
 #include <vector>
 #include <functional>
-#include <unistd.h>
 #include <iostream>
-#include <fcntl.h>
-#include <arpa/inet.h>
-#include <sys/epoll.h>
-#include <sys/resource.h>
 #include <system_error>
 #include <stdexcept>
 #include <string>
+#include <streambuf>
+
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <fcntl.h>
 #include <string.h>
 
+static const size_t block_size = 1024;
+
+class coronet;
+
+class coroibuf: public std::basic_streambuf<char> {
+    coronet& coro_;
+    int fd_;
+    const std::size_t put_back_;
+    std::vector<char> buffer_;
+public:
+    explicit coroibuf(
+        int fd, coronet& coro,
+        std::size_t buff_sz = block_size, std::size_t put_back = 8
+    ): coro_(coro), fd_(fd), put_back_(std::max(put_back, size_t(1))),
+       buffer_(std::max(buff_sz, put_back_) + put_back_) {
+        char* end = &buffer_.front() + buffer_.size();
+        setg(end, end, end);
+    }
+
+    coroibuf(const coroibuf &) = delete;
+    coroibuf& operator=(const coroibuf &) = delete;
+
+private:
+    int_type underflow();
+};
+
+class coroobuf: public std::basic_streambuf<char> {
+    coronet& coro_;
+    int fd_;
+    std::vector<char> buffer_;
+public:
+    explicit coroobuf(
+        int fd, coronet& coro,
+        std::size_t buff_sz = block_size
+    ): coro_(coro), fd_(fd), buffer_(buff_sz + 1) {
+        char* base = &buffer_.front();
+        setp(base, base + buffer_.size() - 1); // -1 to make overflow() easier
+    }
+
+    coroobuf(const coroobuf &) = delete;
+    coroobuf& operator=(const coroobuf &) = delete;
+
+private:
+    int_type overflow(int_type ch);
+    int sync();
+};
+
 class coronet {
-    static const size_t block_size = 1024;
     static const size_t max_events = 1024;
     // The sub-contexts send true if they are waiting for a write,
     // false otherwise.
@@ -23,9 +72,15 @@ class coronet {
     std::vector<boost::context::execution_context<bool>> running_contextes;
     std::vector<std::function<void(int)>> connection_handlers;
     std::vector<bool> is_listening;
+    std::vector<bool> is_closed;
+    std::vector<bool> is_good_;
+    std::vector<std::unique_ptr<coroibuf>> ibufs;
+    std::vector<std::unique_ptr<std::istream>> istreams;
+    std::vector<std::unique_ptr<coroobuf>> obufs;
+    std::vector<std::unique_ptr<std::ostream>> ostreams;
     int epoll;
 
-    template<typename T, typename U> 
+    template<typename T, typename U>
     void set_vector(std::vector<T>& vec, int pos, U&& val) {
         if (pos < 0) throw std::out_of_range("Negative position");
         if (vec.size() <= (unsigned long long) pos) vec.resize(pos+1);
@@ -34,7 +89,7 @@ class coronet {
 
     void add_watched_socket(int fd) {
         struct epoll_event watched;
-        watched.events = EPOLLIN;
+        watched.events = (EPOLLIN | EPOLLRDHUP | EPOLLET);
         watched.data.fd = fd;
         if (epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &watched) == -1) {
             throw std::system_error(errno, std::generic_category(), "epoll_ctl");
@@ -43,9 +98,15 @@ class coronet {
 
     void edit_watched_socket(int fd, bool write = false) {
         struct epoll_event watched;
-        watched.events = write ? EPOLLOUT : EPOLLIN;
+        watched.events = EPOLLET | EPOLLRDHUP | (write ? EPOLLOUT : EPOLLIN);
         watched.data.fd = fd;
         if (epoll_ctl(epoll, EPOLL_CTL_MOD, fd, &watched) == -1) {
+            throw std::system_error(errno, std::generic_category(), "epoll_ctl");
+        }
+    }
+    
+    void remove_watched_socket(int fd) {
+        if (epoll_ctl(epoll, EPOLL_CTL_DEL, fd, NULL) == -1) {
             throw std::system_error(errno, std::generic_category(), "epoll_ctl");
         }
     }
@@ -73,17 +134,19 @@ class coronet {
             close(fd);
             return std::move(main_context);
         };
-        boost::context::execution_context<bool> subctx(childfun);
+        boost::context::execution_context<bool> subctx{childfun};
+        set_vector(is_closed, fd, false);
+        set_vector(is_good_, fd, true);
         set_vector(running_contextes, fd, std::move(subctx));
+        set_vector(ibufs, fd, std::make_unique<coroibuf>(fd, *this));
+        set_vector(istreams, fd, std::make_unique<std::istream>(ibufs[fd].get()));
+        set_vector(obufs, fd, std::make_unique<coroobuf>(fd, *this));
+        set_vector(ostreams, fd, std::make_unique<std::ostream>(obufs[fd].get()));
         resume_subcontext(fd);
     }
 
     void handle_ready_socket(int fd, uint32_t event) {
         try {
-            if (event & EPOLLERR || event & EPOLLHUP) {
-                close(fd);
-                throw std::runtime_error("Something went wrong with fd " + std::to_string(fd));
-            }
             if (event & EPOLLIN && is_listening.size() > (unsigned) fd && is_listening[fd]) {
                 int client = accept4(fd, nullptr, nullptr, SOCK_NONBLOCK);
                 if (client == -1) {
@@ -97,7 +160,7 @@ class coronet {
             }
             resume_subcontext(fd);
         } catch (std::exception& exc) {
-            std::cerr << "Exception in main context " << exc.what() << std::endl;
+            std::cerr << "Exception in main context: " << exc.what() << std::endl;
         }
     }
 
@@ -106,10 +169,11 @@ public:
         epoll = epoll_create(1);
     }
 
-    std::size_t read(int fd, uint8_t* data, std::size_t data_size) {
+    std::size_t read(int fd, char* data, std::size_t data_size) {
         while (true) {
             ssize_t read_now = ::read(fd, data, data_size);
             if (read_now == -1 && errno != EAGAIN) {
+                is_good_[fd] = false;
                 throw std::system_error(errno, std::generic_category(), "read");
             }
             if (read_now == -1 && errno == EAGAIN) {
@@ -122,50 +186,12 @@ public:
         }
     }
 
-    std::size_t read(int fd, std::vector<uint8_t>& data) {
-        return read(fd, data.data(), data.size());
-    }
-
-    std::vector<uint8_t> read(int fd, std::size_t size = block_size) {
-        std::vector<uint8_t> res(size);
-        res.resize(read(fd, res));
-        return res;
-    }
-
-    std::size_t read_all(int fd, uint8_t* data, std::size_t data_size) {
-        std::size_t read_so_far = 0;
-        std::size_t current_read = 0;
-        do {
-            current_read = read(fd, data+read_so_far, data_size-read_so_far);
-            read_so_far += current_read;
-        } while (current_read != 0);
-        return read_so_far;
-    }
-
-    std::size_t read_all(int fd, std::vector<uint8_t>& data) {
-        return read_all(fd, data.data(), data.size());
-    }
-
-    std::vector<uint8_t> read_all(int fd) {
-        std::vector<uint8_t> res(block_size);
-        std::size_t read_so_far = 0;
-        std::size_t current_read = 0;
-        do {
-            if (read_so_far + block_size/2 > res.size()) {
-                res.resize(res.size() + block_size);
-            }
-            current_read = read(fd, res.data()+read_so_far, res.size()-read_so_far);
-            read_so_far += current_read;
-        } while (current_read != 0);
-        res.resize(read_so_far);
-        return res;
-    }
-
-    void write(int fd, const uint8_t* data, std::size_t data_size) {
+    void write(int fd, const char* data, std::size_t data_size) {
         std::size_t written_so_far = 0;
         do {
-            ssize_t written_now = ::write(fd, data+written_so_far, data_size-written_so_far);
+            ssize_t written_now = ::send(fd, data+written_so_far, data_size-written_so_far, MSG_NOSIGNAL);
             if (written_now == -1 && errno != EAGAIN) {
+                is_good_[fd] = false;
                 throw std::system_error(errno, std::generic_category(), "write");
             }
             if (written_now == -1 && errno == EAGAIN) {
@@ -175,10 +201,6 @@ public:
             }
             written_so_far += written_now;
         } while (written_so_far < data_size);
-    }
-
-    void write(int fd, const std::vector<uint8_t>& data) {
-        return write(fd, data.data(), data.size());
     }
 
     void listen(const std::string& s_addr, int port, std::function<void(int)>&& callback) {
@@ -217,6 +239,7 @@ public:
         while (true) {
             std::vector<struct epoll_event> events(max_events);
             int num_fd = epoll_wait(epoll, events.data(), max_events, -1);
+            if (num_fd == -1 && errno == EINTR) continue;
             if (num_fd == -1) {
                 throw std::system_error(errno, std::generic_category(), "epoll_wait");
             }
@@ -225,5 +248,70 @@ public:
             }
         }
     }
+
+    void close(int fd) {
+        if (is_closed[fd]) return;
+        is_closed[fd] = true;
+        *ostreams[fd] << std::flush;
+        remove_watched_socket(fd);
+        ::close(fd);
+    }
+
+    /**
+     *  Get input/output streams. If two different coroutines use the same
+     * i/ostream the result is undefined. The streams are guaranteed to be
+     * valid as long as the corresponding file descriptor is not closed.
+     */
+    std::istream& get_istream(int fd) {return *istreams[fd];}
+    std::ostream& get_ostream(int fd) {return *ostreams[fd];}
+
+    bool is_good(int fd) {return is_good_[fd];}
 };
+
+coroibuf::int_type coroibuf::underflow() {
+    if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+
+    char *base = &buffer_.front();
+    char *start = base;
+    if (eback() == base) { // true when this isn't the first fill
+        // Make arrangements for putback characters
+        memmove(base, egptr() - put_back_, put_back_);
+        start += put_back_;
+    }
+    // start is now the start of the buffer, proper.
+    // Read from fptr_ in to the provided buffer
+    size_t n = 0;
+    if (!coro_.is_good(fd_)) return traits_type::eof();
+    try {
+        n = coro_.read(fd_, start, buffer_.size() - (start - base));
+    } catch (std::exception& e) {
+        std::cerr << "Error during underflow: " << e.what() << std::endl;
+        return traits_type::eof();
+    }
+    if (n == 0) return traits_type::eof();
+    // Set buffer pointers
+    setg(base, start, start + n);
+    return traits_type::to_int_type(*gptr());
+}
+
+coroobuf::int_type coroobuf::overflow(coroobuf::int_type ch) {
+    if (!coro_.is_good(fd_) || ch == traits_type::eof()) return traits_type::eof();
+    *pptr() = ch;
+    pbump(1);
+    if (sync() == -1) return traits_type::eof();
+    return ch;
+}
+
+int coroobuf::sync() {
+    if (!coro_.is_good(fd_)) return -1;
+    std::ptrdiff_t n = pptr() - pbase();
+    pbump(-n);
+    try {
+        coro_.write(fd_, pbase(), n);
+    } catch (std::exception& e) {
+        std::cerr << "Error during sync: " << e.what() << std::endl;
+        return -1;
+    }
+    return 0;
+}
 #endif
