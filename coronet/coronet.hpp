@@ -8,12 +8,14 @@
 #include <stdexcept>
 #include <string>
 #include <streambuf>
+#include <chrono>
 
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <fcntl.h>
 #include <string.h>
 
@@ -74,16 +76,27 @@ class coronet {
     std::vector<bool> is_listening;
     std::vector<bool> is_closed;
     std::vector<bool> is_good_;
+    std::vector<bool> has_timed_out;
+    std::vector<int> timer_fds;
+    std::vector<int> timer_for;
     std::vector<std::unique_ptr<coroibuf>> ibufs;
     std::vector<std::unique_ptr<std::istream>> istreams;
     std::vector<std::unique_ptr<coroobuf>> obufs;
     std::vector<std::unique_ptr<std::ostream>> ostreams;
+    int running_ctxes = 0;
     int epoll;
 
     template<typename T, typename U>
     void set_vector(std::vector<T>& vec, int pos, U&& val) {
         if (pos < 0) throw std::out_of_range("Negative position");
         if (vec.size() <= (unsigned long long) pos) vec.resize(pos+1);
+        vec[pos] = std::move(val);
+    }
+
+    template<typename T, typename U>
+    void set_vector(std::vector<T>& vec, int pos, U&& val, T def) {
+        if (pos < 0) throw std::out_of_range("Negative position");
+        if (vec.size() <= (unsigned long long) pos) vec.resize(pos+1, def);
         vec[pos] = std::move(val);
     }
 
@@ -104,7 +117,7 @@ class coronet {
             throw std::system_error(errno, std::generic_category(), "epoll_ctl");
         }
     }
-    
+
     void remove_watched_socket(int fd) {
         if (epoll_ctl(epoll, EPOLL_CTL_DEL, fd, NULL) == -1) {
             throw std::system_error(errno, std::generic_category(), "epoll_ctl");
@@ -125,23 +138,41 @@ class coronet {
             throw std::runtime_error("invalid client function");
         }
         auto childfun = [=] (boost::context::execution_context<bool>&& ctx, bool val) mutable {
+            running_ctxes++;
             try {
                 main_context = std::move(ctx);
                 connection_handlers[listen_fd](fd);
+            } catch (timeout& t) {
+                std::cerr << t.what() << std::endl;
             } catch (std::exception& exc) {
                 std::cerr << "Exception in subcontext: " << exc.what() << std::endl;
             }
-            close(fd);
+            running_ctxes--;
+            close(fd, true);
             return std::move(main_context);
         };
-        boost::context::execution_context<bool> subctx{childfun};
+
+        int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+        set_vector(timer_fds, fd, tfd);
+        set_vector(timer_for, tfd, fd, -1);
+        set_vector(has_timed_out, fd, false);
+        using namespace std::chrono_literals;
+        set_timeout(fd, 10s);
+        add_watched_socket(tfd);
+
+        set_vector(ibufs, fd, std::make_unique<coroibuf>(fd, *this));
+        auto ist = std::make_unique<std::istream>(ibufs[fd].get());
+        ist->exceptions(std::istream::badbit);
+        set_vector(istreams, fd, ist);
+        set_vector(obufs, fd, std::make_unique<coroobuf>(fd, *this));
+        auto ost = std::make_unique<std::ostream>(obufs[fd].get());
+        ost->exceptions(std::ostream::badbit);
+        set_vector(ostreams, fd, ost);
         set_vector(is_closed, fd, false);
         set_vector(is_good_, fd, true);
+
+        boost::context::execution_context<bool> subctx{childfun};
         set_vector(running_contextes, fd, std::move(subctx));
-        set_vector(ibufs, fd, std::make_unique<coroibuf>(fd, *this));
-        set_vector(istreams, fd, std::make_unique<std::istream>(ibufs[fd].get()));
-        set_vector(obufs, fd, std::make_unique<coroobuf>(fd, *this));
-        set_vector(ostreams, fd, std::make_unique<std::ostream>(obufs[fd].get()));
         resume_subcontext(fd);
     }
 
@@ -158,6 +189,10 @@ class coronet {
             if (is_listening.size() > (unsigned) fd && is_listening[fd]) {
                 throw std::runtime_error("Invalid event");
             }
+            if (event & EPOLLIN && timer_for.size() > (unsigned) fd && timer_for[fd] != -1) {
+                fd = timer_for[fd];
+                has_timed_out[fd] = true;
+            }
             resume_subcontext(fd);
         } catch (std::exception& exc) {
             std::cerr << "Exception in main context: " << exc.what() << std::endl;
@@ -165,6 +200,11 @@ class coronet {
     }
 
 public:
+    class timeout: public std::runtime_error {
+    public:
+        timeout(const std::string& msg): std::runtime_error(msg) {}
+    };
+
     coronet() {
         epoll = epoll_create(1);
     }
@@ -174,12 +214,16 @@ public:
             ssize_t read_now = ::read(fd, data, data_size);
             if (read_now == -1 && errno != EAGAIN) {
                 is_good_[fd] = false;
-                throw std::system_error(errno, std::generic_category(), "read");
+                throw std::system_error(errno, std::generic_category(), "read " + std::to_string(fd));
             }
             if (read_now == -1 && errno == EAGAIN) {
                 // Do context switching and try again
                 auto tmp = main_context(false);
                 main_context = std::move(std::get<0>(tmp));
+                // If a timeout happened...
+                if (has_timed_out.size() > (unsigned) fd && has_timed_out[fd]) {
+                    throw timeout("read timeout: " + std::to_string(fd));
+                }
                 continue;
             }
             return read_now;
@@ -192,12 +236,16 @@ public:
             ssize_t written_now = ::send(fd, data+written_so_far, data_size-written_so_far, MSG_NOSIGNAL);
             if (written_now == -1 && errno != EAGAIN) {
                 is_good_[fd] = false;
-                throw std::system_error(errno, std::generic_category(), "write");
+                throw std::system_error(errno, std::generic_category(), "write " + std::to_string(fd));
             }
             if (written_now == -1 && errno == EAGAIN) {
                 // Do context switching
                 auto tmp = main_context(true);
                 main_context = std::move(std::get<0>(tmp));
+                // If a timeout happened...
+                if (has_timed_out.size() > (unsigned) fd && has_timed_out[fd]) {
+                    throw timeout("write timeout: " + std::to_string(fd));
+                }
             }
             written_so_far += written_now;
         } while (written_so_far < data_size);
@@ -249,10 +297,13 @@ public:
         }
     }
 
-    void close(int fd) {
+    void close(int fd, bool nosync=false) {
         if (is_closed[fd]) return;
+        timer_for[timer_fds[fd]] = -1;
+        remove_watched_socket(timer_fds[fd]);
+        ::close(timer_fds[fd]);
         is_closed[fd] = true;
-        *ostreams[fd] << std::flush;
+        if (!nosync) *ostreams[fd] << std::flush;
         remove_watched_socket(fd);
         ::close(fd);
     }
@@ -266,6 +317,16 @@ public:
     std::ostream& get_ostream(int fd) {return *ostreams[fd];}
 
     bool is_good(int fd) {return is_good_[fd];}
+
+    void set_timeout(int fd, std::chrono::duration<long int> to) {
+        using namespace std::chrono;
+        struct itimerspec ts;
+        ts.it_interval.tv_sec = 0;
+        ts.it_interval.tv_nsec = 0;
+        ts.it_value.tv_sec = duration_cast<seconds>(to).count();
+        ts.it_value.tv_nsec = duration_cast<nanoseconds>(to).count() % 1000000000;
+        timerfd_settime(timer_fds[fd], 0, &ts, nullptr);
+    }
 };
 
 coroibuf::int_type coroibuf::underflow() {
@@ -282,12 +343,7 @@ coroibuf::int_type coroibuf::underflow() {
     // Read from fptr_ in to the provided buffer
     size_t n = 0;
     if (!coro_.is_good(fd_)) return traits_type::eof();
-    try {
-        n = coro_.read(fd_, start, buffer_.size() - (start - base));
-    } catch (std::exception& e) {
-        std::cerr << "Error during underflow: " << e.what() << std::endl;
-        return traits_type::eof();
-    }
+    n = coro_.read(fd_, start, buffer_.size() - (start - base));
     if (n == 0) return traits_type::eof();
     // Set buffer pointers
     setg(base, start, start + n);
@@ -306,12 +362,7 @@ int coroobuf::sync() {
     if (!coro_.is_good(fd_)) return -1;
     std::ptrdiff_t n = pptr() - pbase();
     pbump(-n);
-    try {
-        coro_.write(fd_, pbase(), n);
-    } catch (std::exception& e) {
-        std::cerr << "Error during sync: " << e.what() << std::endl;
-        return -1;
-    }
+    coro_.write(fd_, pbase(), n);
     return 0;
 }
 #endif
